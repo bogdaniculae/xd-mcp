@@ -201,47 +201,59 @@ function formatSpecs(specs: ArtboardSpecs): string {
   lines.push('');
 
   // ── Colors ──────────────────────────────────────────────────────────────
+  // Aggregate to a unique palette per role (a board can repeat one colour
+  // across hundreds of elements; list each value once with a usage count).
   lines.push('## Colors');
   if (specs.colors.length === 0) {
     lines.push('None found.');
   } else {
-    // Group by role
-    const fills = specs.colors.filter((c) => c.role === 'fill');
-    const strokes = specs.colors.filter((c) => c.role === 'stroke');
-    const texts = specs.colors.filter((c) => c.role === 'text');
-
-    if (fills.length) {
-      lines.push('### Fill Colors');
-      for (const c of fills) {
+    const palette = (role: ColorSpec['role']) => {
+      const agg = new Map<string, { hex: string; rgba: string; opacity: number; count: number }>();
+      for (const c of specs.colors) {
+        if (c.role !== role) continue;
+        const cur = agg.get(c.hex);
+        if (cur) cur.count++;
+        else agg.set(c.hex, { hex: c.hex, rgba: c.rgba, opacity: c.opacity, count: 1 });
+      }
+      return [...agg.values()].sort((a, b) => b.count - a.count);
+    };
+    const section = (title: string, role: ColorSpec['role']) => {
+      const colors = palette(role);
+      if (!colors.length) return;
+      lines.push(`### ${title}`);
+      for (const c of colors) {
         const opStr = c.opacity < 1 ? ` (opacity: ${c.opacity.toFixed(2)})` : '';
-        lines.push(`  ${c.elementName}: ${c.hex} / ${c.rgba}${opStr}`);
+        lines.push(`  ${c.hex} / ${c.rgba}${opStr}  ×${c.count}`);
       }
-    }
-    if (texts.length) {
-      lines.push('### Text Colors');
-      for (const c of texts) {
-        lines.push(`  ${c.elementName}: ${c.hex} / ${c.rgba}`);
-      }
-    }
-    if (strokes.length) {
-      lines.push('### Stroke/Border Colors');
-      for (const c of strokes) {
-        lines.push(`  ${c.elementName}: ${c.hex} / ${c.rgba}`);
-      }
-    }
+    };
+    section('Fill Colors', 'fill');
+    section('Text Colors', 'text');
+    section('Stroke/Border Colors', 'stroke');
   }
   lines.push('');
 
   // ── Typography ──────────────────────────────────────────────────────────
+  // Collapse to the unique type scale — identical styles repeat across many
+  // text nodes, so key by the full style signature and count occurrences.
   lines.push('## Typography');
   if (specs.typography.length === 0) {
     lines.push('None found.');
   } else {
+    const agg = new Map<string, { t: TypographySpec; count: number }>();
     for (const t of specs.typography) {
-      lines.push(`### ${t.elementName}`);
-      lines.push(`  font-family: ${t.fontFamily}`);
-      lines.push(`  font-size: ${t.fontSize}px`);
-      lines.push(`  font-weight: ${t.fontWeight}`);
+      const sig = [
+        t.fontFamily, t.fontSize, t.fontWeight, t.lineHeight,
+        t.letterSpacing, t.textAlign, t.textTransform, t.color,
+      ].join('|');
+      const cur = agg.get(sig);
+      if (cur) cur.count++;
+      else agg.set(sig, { t, count: 1 });
+    }
+    const styles = [...agg.values()].sort(
+      (a, b) => (b.t.fontSize || 0) - (a.t.fontSize || 0)
+    );
+    for (const { t, count } of styles) {
+      lines.push(`### ${t.fontFamily} ${t.fontSize}px / ${t.fontWeight}  ×${count}`);
       if (t.lineHeight) lines.push(`  line-height: ${t.lineHeight}px`);
       if (t.letterSpacing !== undefined) lines.push(`  letter-spacing: ${t.letterSpacing}em`);
       if (t.textAlign) lines.push(`  text-align: ${t.textAlign}`);
@@ -252,21 +264,32 @@ function formatSpecs(specs: ArtboardSpecs): string {
   lines.push('');
 
   // ── Borders ──────────────────────────────────────────────────────────────
+  // Dedupe identical border definitions (width + colour + position + radius).
   lines.push('## Borders & Border Radius');
-  if (specs.borders.length === 0) {
-    lines.push('None found.');
-  } else {
-    for (const b of specs.borders) {
-      lines.push(`### ${b.elementName}`);
-      lines.push(`  border: ${b.width}px ${b.color} (position: ${b.position})`);
-      if (b.borderRadius) lines.push(`  border-radius: ${b.borderRadius}`);
+  const borderAgg = new Map<string, { b: BorderSpec; count: number }>();
+  for (const b of specs.borders) {
+    const sig = `${b.width}|${b.color}|${b.position}|${b.borderRadius ?? ''}`;
+    const cur = borderAgg.get(sig);
+    if (cur) cur.count++;
+    else borderAgg.set(sig, { b, count: 1 });
+  }
+  // Unique border-radius values on non-bordered elements.
+  const radii = new Map<string, number>();
+  for (const e of specs.elements) {
+    if (e.borderRadius && !specs.borders.find((b) => b.borderRadius === e.borderRadius)) {
+      radii.set(e.borderRadius, (radii.get(e.borderRadius) ?? 0) + 1);
     }
   }
-  // Also list border-radius on non-bordered elements
-  const radiiOnly = specs.elements.filter((e) => e.borderRadius && !specs.borders.find((b) => b.elementName === e.name));
-  for (const e of radiiOnly) {
-    lines.push(`### ${e.name} (radius only)`);
-    lines.push(`  border-radius: ${e.borderRadius}`);
+  if (borderAgg.size === 0 && radii.size === 0) {
+    lines.push('None found.');
+  } else {
+    for (const { b, count } of borderAgg.values()) {
+      const radius = b.borderRadius ? `, radius ${b.borderRadius}` : '';
+      lines.push(`  ${b.width}px ${b.color} (${b.position})${radius}  ×${count}`);
+    }
+    for (const [r, count] of radii) {
+      lines.push(`  border-radius: ${r}  ×${count}`);
+    }
   }
   lines.push('');
 
@@ -302,15 +325,28 @@ function formatSpecs(specs: ArtboardSpecs): string {
   lines.push('');
 
   // ── Layout & Spacing ─────────────────────────────────────────────────────
+  // Only named, sized elements — skip the thousands of "unnamed" vector nodes
+  // and zero-size placeholders that would otherwise bury the useful structure.
   lines.push('## Layout & Spacing');
-  lines.push('Element positions and dimensions (absolute to artboard):');
-  for (const s of specs.spacing) {
-    lines.push(`  ${s.elementName}: x=${s.x}px, y=${s.y}px, w=${s.width}px, h=${s.height}px`);
+  lines.push('Named elements with a size (absolute to artboard):');
+  const LAYOUT_CAP = 150;
+  const layout = specs.spacing.filter(
+    (s) => s.elementName !== 'unnamed' && (s.width > 0 || s.height > 0)
+  );
+  for (const s of layout.slice(0, LAYOUT_CAP)) {
+    lines.push(`  ${truncate(s.elementName)}: x=${s.x}px, y=${s.y}px, w=${s.width}px, h=${s.height}px`);
     if (s.paddingTop !== undefined) {
       lines.push(
         `    padding: ${s.paddingTop}px ${s.paddingRight ?? 0}px ${s.paddingBottom ?? 0}px ${s.paddingLeft ?? 0}px`
       );
     }
+  }
+  if (layout.length > LAYOUT_CAP) {
+    lines.push(`  … ${layout.length - LAYOUT_CAP} more named elements omitted.`);
+  }
+  const hidden = specs.spacing.length - layout.length;
+  if (hidden > 0) {
+    lines.push(`(${hidden} unnamed/zero-size nodes hidden.)`);
   }
   lines.push('');
 
@@ -328,18 +364,23 @@ function formatSpecs(specs: ArtboardSpecs): string {
     }
   }
 
+  // One variable per unique font size (the type scale), not per text node.
+  const sizes = new Map<number, TypographySpec>();
   for (const t of specs.typography) {
-    const safeName = t.elementName.toLowerCase().replace(/[^a-z0-9]/g, '-');
-    lines.push(`$font-family-${safeName}: '${t.fontFamily}';`);
-    lines.push(`$font-size-${safeName}: ${t.fontSize}px;`);
-    lines.push(`$font-weight-${safeName}: ${t.fontWeight};`);
-    if (t.lineHeight) lines.push(`$line-height-${safeName}: ${t.lineHeight}px;`);
-    if (t.letterSpacing !== undefined) lines.push(`$letter-spacing-${safeName}: ${t.letterSpacing}em;`);
+    if (!sizes.has(t.fontSize)) sizes.set(t.fontSize, t);
+  }
+  for (const t of [...sizes.values()].sort((a, b) => b.fontSize - a.fontSize)) {
+    const safe = `${t.fontSize}`;
+    lines.push(`$font-size-${safe}: ${t.fontSize}px; // ${t.fontFamily} ${t.fontWeight}`);
+    if (t.lineHeight) lines.push(`$line-height-${safe}: ${t.lineHeight}px;`);
   }
 
+  const seenShadows = new Set<string>();
+  let shadowIndex = 1;
   for (const s of specs.shadows) {
-    const safeName = s.elementName.toLowerCase().replace(/[^a-z0-9]/g, '-');
-    lines.push(`$shadow-${safeName}: ${s.cssValue};`);
+    if (seenShadows.has(s.cssValue)) continue;
+    seenShadows.add(s.cssValue);
+    lines.push(`$shadow-${shadowIndex++}: ${s.cssValue};`);
   }
 
   lines.push('```');
