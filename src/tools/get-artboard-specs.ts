@@ -189,6 +189,10 @@ function collectFromElements(
   }
 }
 
+function truncate(name: string, max = 40): string {
+  return name.length > max ? `${name.slice(0, max)}…` : name;
+}
+
 function formatSpecs(specs: ArtboardSpecs): string {
   const lines: string[] = [];
 
@@ -277,9 +281,29 @@ function formatSpecs(specs: ArtboardSpecs): string {
   }
   lines.push('');
 
+  // ── Vertical Spacing between text blocks ─────────────────────────────────
+  lines.push('## Vertical Spacing (gaps between text blocks, top→bottom)');
+  const textNames = new Set(specs.typography.map((t) => t.elementName));
+  const textBoxes = specs.spacing
+    .filter((s) => textNames.has(s.elementName) && s.height > 0)
+    .sort((a, b) => a.y - b.y);
+  if (textBoxes.length < 2) {
+    lines.push('Not enough text blocks to measure.');
+  } else {
+    for (let i = 1; i < textBoxes.length; i++) {
+      const prev = textBoxes[i - 1];
+      const cur = textBoxes[i];
+      const gap = Math.round(cur.y - (prev.y + prev.height));
+      lines.push(
+        `  ${gap}px  between "${truncate(prev.elementName)}" (y=${prev.y}) and "${truncate(cur.elementName)}" (y=${cur.y})`
+      );
+    }
+  }
+  lines.push('');
+
   // ── Layout & Spacing ─────────────────────────────────────────────────────
   lines.push('## Layout & Spacing');
-  lines.push('Element positions and dimensions (relative to artboard):');
+  lines.push('Element positions and dimensions (absolute to artboard):');
   for (const s of specs.spacing) {
     lines.push(`  ${s.elementName}: x=${s.x}px, y=${s.y}px, w=${s.width}px, h=${s.height}px`);
     if (s.paddingTop !== undefined) {

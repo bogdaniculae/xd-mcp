@@ -21,7 +21,7 @@ interface ArtworkNode {
   name?: string;
   type?: string;
   visible?: boolean;
-  transform?: { a: number; b: number; c: number; d: number; e: number; f: number };
+  transform?: { a?: number; b?: number; c?: number; d?: number; e?: number; f?: number; tx?: number; ty?: number };
   shape?: { width?: number; height?: number; r?: number[] | number; type?: string };
   style?: {
     fill?: unknown;
@@ -29,6 +29,8 @@ interface ArtworkNode {
     shadow?: unknown;
     opacity?: number;
     blendMode?: string;
+    font?: { postscriptName?: string; family?: string; style?: string; size?: number };
+    textAttributes?: { lineHeight?: number; letterSpacing?: number; paragraphAlign?: string };
   };
   text?: {
     frame?: { width?: number; height?: number };
@@ -48,6 +50,7 @@ interface ArtworkNode {
       align?: string;
     }>;
   };
+  group?: { children?: ArtworkNode[] };
   children?: ArtworkNode[];
   artboard?: {
     width?: number;
@@ -59,6 +62,7 @@ interface ArtworkNode {
 
 export class XDParser {
   private zip: AdmZip;
+  private artboardBounds: Map<string, { width: number; height: number; x: number; y: number }> | null = null;
 
   constructor(buffer: Buffer) {
     this.zip = new AdmZip(buffer);
@@ -146,34 +150,72 @@ export class XDParser {
     return JSON.parse(entry.getData().toString('utf-8'));
   }
 
-  private extractArtboardsFromManifest(manifest: unknown): ManifestArtboard[] {
-    const m = manifest as Record<string, unknown>;
-    const children = (m['children'] as unknown[]) || [];
-    const results: ManifestArtboard[] = [];
+  /**
+   * Reads the central artboard bounds map (ref id → width/height) from
+   * resources/graphics/graphicContent.agc. Cached after first read.
+   */
+  private getArtboardBounds(): Map<string, { width: number; height: number; x: number; y: number }> {
+    if (this.artboardBounds) return this.artboardBounds;
 
-    for (const child of children) {
-      const c = child as Record<string, unknown>;
-      if (c['name'] === 'artwork') {
-        const artworkChildren = (c['children'] as unknown[]) || [];
-        for (const artworkChild of artworkChildren) {
-          const ac = artworkChild as Record<string, unknown>;
-          if (ac['name'] === 'pasteboard') {
-            const pasteboardChildren = (ac['children'] as unknown[]) || [];
-            for (const artboard of pasteboardChildren) {
-              const ab = artboard as Record<string, unknown>;
-              if (ab['path'] && ab['name'] && ab['id']) {
-                results.push({
-                  id: ab['id'] as string,
-                  name: ab['name'] as string,
-                  path: ab['path'] as string,
-                });
-              }
-            }
+    const map = new Map<string, { width: number; height: number; x: number; y: number }>();
+    const entry = this.zip.getEntry('resources/graphics/graphicContent.agc');
+    if (entry) {
+      try {
+        const data = JSON.parse(entry.getData().toString('utf-8')) as Record<string, unknown>;
+        const boards = (data['artboards'] as Record<string, unknown>) || {};
+        for (const [ref, val] of Object.entries(boards)) {
+          const v = val as Record<string, unknown>;
+          if (typeof v['width'] === 'number' && typeof v['height'] === 'number') {
+            map.set(ref, {
+              width: v['width'],
+              height: v['height'],
+              x: typeof v['x'] === 'number' ? v['x'] : 0,
+              y: typeof v['y'] === 'number' ? v['y'] : 0,
+            });
           }
         }
+      } catch {
+        // Resource file missing or malformed — bounds stay empty.
       }
     }
 
+    this.artboardBounds = map;
+    return map;
+  }
+
+  private extractArtboardsFromManifest(manifest: unknown): ManifestArtboard[] {
+    const results: ManifestArtboard[] = [];
+    const seen = new Set<string>();
+
+    // Artboards are nodes whose `path` points at an `artboard-<uuid>` folder.
+    // Newer XD files list them directly under the `artwork` node; older ones
+    // nest them inside its `pasteboard` child. Walk the whole tree and collect
+    // anything that looks like an artboard instead of assuming a fixed depth.
+    const walk = (node: unknown): void => {
+      if (!node || typeof node !== 'object') return;
+      const n = node as Record<string, unknown>;
+
+      const path = n['path'];
+      const name = n['name'];
+      const id = n['id'];
+      if (
+        typeof path === 'string' &&
+        path.startsWith('artboard-') &&
+        typeof name === 'string' &&
+        typeof id === 'string' &&
+        !seen.has(id)
+      ) {
+        seen.add(id);
+        results.push({ id, name, path });
+      }
+
+      const children = n['children'];
+      if (Array.isArray(children)) {
+        for (const child of children) walk(child);
+      }
+    };
+
+    walk(manifest);
     return results;
   }
 
@@ -189,12 +231,16 @@ export class XDParser {
     const data = JSON.parse(entry.getData().toString('utf-8')) as ArtworkNode;
 
     // Root has a `children` array; the first child of type "artboard" holds
-    // the dimensions and its own children under child.artboard.children.
+    // its own children under child.artboard.children.
     const artboardChild = (data.children || []).find((c) => c.type === 'artboard');
     const artboardNode = artboardChild ?? data;
 
-    const width = artboardNode.artboard?.width || artboardNode.shape?.width || 0;
-    const height = artboardNode.artboard?.height || artboardNode.shape?.height || 0;
+    // Dimensions live centrally in resources/graphics/graphicContent.agc, keyed
+    // by the artboard's ref id (the path uuid without the `artboard-` prefix).
+    const ref = meta.path.replace(/^artboard-/, '');
+    const bounds = this.getArtboardBounds().get(ref);
+    const width = bounds?.width || artboardNode.artboard?.width || artboardNode.shape?.width || 0;
+    const height = bounds?.height || artboardNode.artboard?.height || artboardNode.shape?.height || 0;
 
     // Children live under artboard.children when the artboard child is present
     const childNodes =
@@ -202,29 +248,53 @@ export class XDParser {
       artboardNode.children ??
       [];
 
+    // The artboard's background fill sits on the artboard child's style, not
+    // on the `artboard` sub-object.
+    const backgroundFill = artboardChild?.style?.fill ?? artboardNode.artboard?.fill;
+
     return {
       id: meta.id,
       name: meta.name,
       width,
       height,
-      background: artboardNode.artboard?.fill
-        ? this.parseFill(artboardNode.artboard.fill)
-        : undefined,
-      children: this.parseChildren(childNodes),
+      background: backgroundFill ? this.parseFill(backgroundFill) : undefined,
+      // Child transforms are in canvas space; subtract the artboard's canvas
+      // origin so element x/y come out relative to the artboard's top-left.
+      children: this.parseChildren(childNodes, -(bounds?.x ?? 0), -(bounds?.y ?? 0)),
     };
   }
 
-  private parseChildren(nodes: ArtworkNode[]): XDElement[] {
-    return nodes.map((node) => this.parseElement(node)).filter(Boolean) as XDElement[];
+  private parseChildren(nodes: ArtworkNode[], offsetX = 0, offsetY = 0): XDElement[] {
+    return nodes
+      .map((node) => this.parseElement(node, offsetX, offsetY))
+      .filter(Boolean) as XDElement[];
   }
 
-  private parseElement(node: ArtworkNode): XDElement {
-    const transform = node.transform || { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 };
-    const x = transform.e || 0;
-    const y = transform.f || 0;
+  private parseElement(node: ArtworkNode, offsetX = 0, offsetY = 0): XDElement {
+    const transform = node.transform || {};
+    // Transforms are relative to the parent; accumulate the offset so x/y are
+    // absolute to the artboard. Position is stored as tx/ty (legacy: e/f).
+    const localX = transform.tx ?? transform.e ?? 0;
+    const localY = transform.ty ?? transform.f ?? 0;
+    const x = offsetX + localX;
+    const y = offsetY + localY;
 
     const width = node.shape?.width || node.text?.frame?.width || 0;
-    const height = node.shape?.height || node.text?.frame?.height || 0;
+    let height = node.shape?.height || node.text?.frame?.height || 0;
+
+    // Text frames are autoHeight (no stored height); estimate from line count ×
+    // line-height so spacing/layout has a usable box.
+    if (!height && node.text) {
+      const lineCount = (node.text.paragraphs || []).reduce(
+        (n, p) => n + (p.lines?.length || 0),
+        0
+      );
+      const lh = node.style?.textAttributes?.lineHeight || node.style?.font?.size || 0;
+      if (lineCount && lh) height = lineCount * lh;
+    }
+
+    // Group contents live under group.children; non-group containers use children.
+    const childNodes = node.group?.children ?? node.children ?? [];
 
     const element: XDElement = {
       id: node.id || '',
@@ -236,10 +306,12 @@ export class XDParser {
       width,
       height,
       opacity: node.style?.opacity !== undefined ? node.style.opacity : 1,
-      children: node.children ? this.parseChildren(node.children) : [],
+      children: childNodes.length ? this.parseChildren(childNodes, x, y) : [],
     };
 
-    if (node.style?.fill) {
+    // For text nodes the fill is the text colour (captured via textStyle), so
+    // only treat fills as element fills on non-text nodes.
+    if (node.style?.fill && node.type !== 'text') {
       element.fills = [this.parseFill(node.style.fill)];
     }
 
@@ -256,7 +328,7 @@ export class XDParser {
     }
 
     if (node.text) {
-      element.textStyle = this.parseTextStyle(node.text);
+      element.textStyle = this.parseTextStyle(node);
     }
 
     return element;
@@ -342,7 +414,35 @@ export class XDParser {
     };
   }
 
-  private parseTextStyle(text: ArtworkNode['text']): XDTextStyle {
+  private parseTextStyle(node: ArtworkNode): XDTextStyle {
+    const nodeStyle = node.style;
+    const font = nodeStyle?.font;
+    const attrs = nodeStyle?.textAttributes;
+    const text = node.text;
+
+    // Modern XD: font lives on style.font, colour on style.fill, line height on
+    // style.textAttributes.
+    if (font) {
+      const style: XDTextStyle = {
+        fontFamily: font.family || font.postscriptName || 'inherit',
+        fontSize: font.size || 16,
+        fontWeight: extractFontWeight(font.style || ''),
+        fontStyle: font.style,
+        lineHeight: attrs?.lineHeight,
+        letterSpacing:
+          attrs?.letterSpacing !== undefined ? attrs.letterSpacing / 1000 : undefined,
+        textAlign: attrs?.paragraphAlign ?? text?.paragraphs?.[0]?.align,
+      };
+
+      if (nodeStyle?.fill) {
+        const fill = this.parseFill(nodeStyle.fill);
+        if (fill.type === 'solid' && fill.color) style.color = fill.color;
+      }
+
+      return style;
+    }
+
+    // Legacy fallback: font info per text line.
     if (!text) return { fontFamily: 'inherit', fontSize: 16, fontWeight: 400 };
 
     const para = text.paragraphs?.[0];
