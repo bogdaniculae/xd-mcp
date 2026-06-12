@@ -21,6 +21,8 @@ interface ArtworkNode {
   name?: string;
   type?: string;
   visible?: boolean;
+  syncSourceGuid?: string;
+  guid?: string;
   transform?: { a?: number; b?: number; c?: number; d?: number; e?: number; f?: number; tx?: number; ty?: number };
   shape?: { width?: number; height?: number; r?: number[] | number; type?: string };
   style?: {
@@ -63,6 +65,8 @@ interface ArtworkNode {
 export class XDParser {
   private zip: AdmZip;
   private artboardBounds: Map<string, { width: number; height: number; x: number; y: number }> | null = null;
+  private symbolIndex: Map<string, ArtworkNode> | null = null;
+  private symbolSizeCache = new Map<string, { width: number; height: number }>();
 
   constructor(buffer: Buffer) {
     this.zip = new AdmZip(buffer);
@@ -183,6 +187,91 @@ export class XDParser {
     return map;
   }
 
+  /**
+   * Indexes every node in the symbols tree by id. Symbol/component instances
+   * (syncRef) reference a source node by guid; this lets us look it up. Cached.
+   */
+  private getSymbolIndex(): Map<string, ArtworkNode> {
+    if (this.symbolIndex) return this.symbolIndex;
+
+    const map = new Map<string, ArtworkNode>();
+    const entry = this.zip.getEntry('resources/graphics/graphicContent.agc');
+    if (entry) {
+      try {
+        const data = JSON.parse(entry.getData().toString('utf-8')) as Record<string, unknown>;
+        const ux = (((data['resources'] as Record<string, unknown>)?.['meta'] as Record<string, unknown>)?.['ux']) as Record<string, unknown> | undefined;
+        const symbols = (ux?.['symbols'] as ArtworkNode[]) || [];
+        const index = (n: ArtworkNode): void => {
+          if (!n || typeof n !== 'object') return;
+          if (typeof n.id === 'string') map.set(n.id, n);
+          for (const k of n.group?.children ?? n.children ?? []) index(k);
+        };
+        for (const s of symbols) index(s);
+      } catch {
+        // No symbols resource — instances simply won't resolve.
+      }
+    }
+
+    this.symbolIndex = map;
+    return map;
+  }
+
+  /**
+   * Resolves a syncRef's source guid to the source node's size. Memoised.
+   */
+  private resolveSyncSize(guid: string): { width: number; height: number } {
+    const cached = this.symbolSizeCache.get(guid);
+    if (cached) return cached;
+
+    const src = this.getSymbolIndex().get(guid);
+    const size = src ? this.symbolNodeSize(src) : { width: 0, height: 0 };
+    this.symbolSizeCache.set(guid, size);
+    return size;
+  }
+
+  /**
+   * Computes the local bounding-box size of a raw symbol node: direct shape/text
+   * size, otherwise the union of its children (resolving nested instances).
+   * Depth-guarded against self-referential symbols.
+   */
+  private symbolNodeSize(node: ArtworkNode, depth = 0): { width: number; height: number } {
+    if (!node || depth > 16) return { width: 0, height: 0 };
+
+    if (node.shape) {
+      const s = shapeSize(node.shape as Record<string, unknown>);
+      if (s.width || s.height) return s;
+    }
+    if (node.text?.frame?.width) {
+      const lineCount = (node.text.paragraphs || []).reduce((n, p) => n + (p.lines?.length || 0), 0);
+      const lh = node.style?.textAttributes?.lineHeight || node.style?.font?.size || 0;
+      return { width: node.text.frame.width, height: lineCount && lh ? lineCount * lh : 0 };
+    }
+
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const child of node.group?.children ?? node.children ?? []) {
+      let src: ArtworkNode | undefined = child;
+      if (child.type === 'syncRef' && !child.shape && !child.group && child.syncSourceGuid) {
+        src = this.getSymbolIndex().get(child.syncSourceGuid);
+      }
+      if (!src) continue;
+      const sz = this.symbolNodeSize(src, depth + 1);
+      if (!sz.width && !sz.height) continue;
+      const t = child.transform ?? {};
+      const cx = t.tx ?? t.e ?? 0;
+      const cy = t.ty ?? t.f ?? 0;
+      minX = Math.min(minX, cx);
+      minY = Math.min(minY, cy);
+      maxX = Math.max(maxX, cx + sz.width);
+      maxY = Math.max(maxY, cy + sz.height);
+    }
+
+    if (minX === Infinity) return { width: 0, height: 0 };
+    return { width: maxX - minX, height: maxY - minY };
+  }
+
   private extractArtboardsFromManifest(manifest: unknown): ManifestArtboard[] {
     const results: ManifestArtboard[] = [];
     const seen = new Set<string>();
@@ -276,11 +365,12 @@ export class XDParser {
     // absolute to the artboard. Position is stored as tx/ty (legacy: e/f).
     const localX = transform.tx ?? transform.e ?? 0;
     const localY = transform.ty ?? transform.f ?? 0;
-    const x = offsetX + localX;
-    const y = offsetY + localY;
+    let x = offsetX + localX;
+    let y = offsetY + localY;
 
-    const width = node.shape?.width || node.text?.frame?.width || 0;
-    let height = node.shape?.height || node.text?.frame?.height || 0;
+    const shapeSz = node.shape ? shapeSize(node.shape as Record<string, unknown>) : null;
+    let width = shapeSz?.width || node.text?.frame?.width || 0;
+    let height = shapeSz?.height || node.text?.frame?.height || 0;
 
     // Text frames are autoHeight (no stored height); estimate from line count ×
     // line-height so spacing/layout has a usable box.
@@ -293,8 +383,29 @@ export class XDParser {
       if (lineCount && lh) height = lineCount * lh;
     }
 
+    // syncRef = symbol/component instance. Bare instances store only a pointer
+    // (syncSourceGuid) to a node in the symbols tree; resolve it for the size.
+    if (!width && !height && node.type === 'syncRef' && node.syncSourceGuid) {
+      const sz = this.resolveSyncSize(node.syncSourceGuid);
+      width = sz.width;
+      height = sz.height;
+    }
+
     // Group contents live under group.children; non-group containers use children.
     const childNodes = node.group?.children ?? node.children ?? [];
+    const children = childNodes.length ? this.parseChildren(childNodes, x, y) : [];
+
+    // Containers (groups, symbol instances) carry no intrinsic size — derive it
+    // from the bounding box of their measurable children.
+    if (!width && !height && children.length) {
+      const box = boundingBox(children);
+      if (box) {
+        x = box.x;
+        y = box.y;
+        width = box.width;
+        height = box.height;
+      }
+    }
 
     const element: XDElement = {
       id: node.id || '',
@@ -306,7 +417,7 @@ export class XDParser {
       width,
       height,
       opacity: node.style?.opacity !== undefined ? node.style.opacity : 1,
-      children: childNodes.length ? this.parseChildren(childNodes, x, y) : [],
+      children,
     };
 
     // For text nodes the fill is the text colour (captured via textStyle), so
@@ -562,6 +673,72 @@ export class XDParser {
 }
 
 // ─── Color helpers ────────────────────────────────────────────────────────────
+
+/** Size of any shape: rect dimensions, ellipse/line geometry, or path bbox. */
+function shapeSize(shape: Record<string, unknown> | undefined): { width: number; height: number } {
+  if (!shape) return { width: 0, height: 0 };
+
+  if (typeof shape['width'] === 'number' && typeof shape['height'] === 'number') {
+    return { width: shape['width'], height: shape['height'] };
+  }
+  if (shape['type'] === 'ellipse') {
+    return {
+      width: Math.abs(((shape['rx'] as number) ?? 0) * 2),
+      height: Math.abs(((shape['ry'] as number) ?? 0) * 2),
+    };
+  }
+  if (shape['type'] === 'line') {
+    return {
+      width: Math.abs(((shape['x2'] as number) ?? 0) - ((shape['x1'] as number) ?? 0)),
+      height: Math.abs(((shape['y2'] as number) ?? 0) - ((shape['y1'] as number) ?? 0)),
+    };
+  }
+  if (typeof shape['path'] === 'string') {
+    return pathSize(shape['path']);
+  }
+  return { width: 0, height: 0 };
+}
+
+/** Loose bounding box of an SVG path string (XD exports absolute coordinates). */
+function pathSize(d: string): { width: number; height: number } {
+  const nums = d.match(/-?\d*\.?\d+(?:e[-+]?\d+)?/gi);
+  if (!nums || nums.length < 2) return { width: 0, height: 0 };
+
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (let i = 0; i + 1 < nums.length; i += 2) {
+    const x = parseFloat(nums[i]);
+    const y = parseFloat(nums[i + 1]);
+    if (!isFinite(x) || !isFinite(y)) continue;
+    minX = Math.min(minX, x);
+    minY = Math.min(minY, y);
+    maxX = Math.max(maxX, x);
+    maxY = Math.max(maxY, y);
+  }
+  if (minX === Infinity) return { width: 0, height: 0 };
+  return { width: maxX - minX, height: maxY - minY };
+}
+
+/** Union bounding box of elements that have a positive size. */
+function boundingBox(
+  els: XDElement[]
+): { x: number; y: number; width: number; height: number } | null {
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const c of els) {
+    if (c.width <= 0 && c.height <= 0) continue;
+    minX = Math.min(minX, c.x);
+    minY = Math.min(minY, c.y);
+    maxX = Math.max(maxX, c.x + c.width);
+    maxY = Math.max(maxY, c.y + c.height);
+  }
+  if (minX === Infinity) return null;
+  return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
+}
 
 export function colorToHex(color: XDColor): string {
   const r = Math.round(color.r).toString(16).padStart(2, '0');
