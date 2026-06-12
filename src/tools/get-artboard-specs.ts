@@ -328,10 +328,14 @@ function formatSpecs(specs: ArtboardSpecs): string {
   // Only named, sized elements — skip the thousands of "unnamed" vector nodes
   // and zero-size placeholders that would otherwise bury the useful structure.
   lines.push('## Layout & Spacing');
-  lines.push('Named elements with a size (absolute to artboard):');
+  lines.push('Meaningfully-named elements with a size (absolute to artboard):');
   const LAYOUT_CAP = 150;
+  // Drop XD's auto-generated names (Path 1234, Group 567, Rectangle 8, …) —
+  // those are vector sub-paths and wrappers, not design-meaningful structure.
+  const isDefaultName = (n: string) =>
+    /^(unnamed|path|group|rectangle|ellipse|shape|line|polygon|vector|oval|union|subtract|intersect)\s*\d*$/i.test(n);
   const layout = specs.spacing.filter(
-    (s) => s.elementName !== 'unnamed' && (s.width > 0 || s.height > 0)
+    (s) => !isDefaultName(s.elementName) && (s.width > 0 || s.height > 0)
   );
   for (const s of layout.slice(0, LAYOUT_CAP)) {
     lines.push(`  ${truncate(s.elementName)}: x=${s.x}px, y=${s.y}px, w=${s.width}px, h=${s.height}px`);
